@@ -399,9 +399,56 @@ seccomp_def_actions = {
     0x80000000: "SCMP_ACT_KILL_PROCESS",
 }
 
-def search_address(pc):
-    
+
+def search_all(pc):
+    listing = currentProgram.getListing()
+    instr_list = listing.getInstructions(pc,False)
+
+    action_addr = None
+    syscall_addr = None
+
+    for instr in instr_list:
+        if action_addr and syscall_addr:
+            break
+        code = instr.toString()
+        mnemonic,op = code.split(" ")
+        if mnemonic.find("MOV") != -1:
+            src,dst = op.split(",")
+            if src.find("RSI") != -1 or src.find("ESI") != -1:
+                action_addr = instr.getAddress()
+            if src.find("RDX") != -1 or src.find("EDX") != -1:
+                syscall_addr = instr.getAddress()
+   
     return (action_addr,syscall_addr)
+
+
+def search_actions(pc):
+    
+    global skip
+
+    listing = currentProgram.getListing()
+    instr_list = listing.getInstructions(pc,False)
+
+    action_addr = None
+
+    for instr in instr_list:
+        if action_addr:
+            break
+        code = instr.toString()
+        mnemonic,op = code.split(" ")
+        if mnemonic.find("MOV") != -1:
+            src,dst = op.split(",")
+            if src.find("RDI") != -1 or src.find("EDI") != -1:
+                action_addr = instr.getAddress()
+
+        if mnemonic.find("XOR") != -1:
+            src,dst = op.split(",")
+            if src.find("RDI") != -1 or src.find("EDI") != -1:
+                action_addr = instr.getAddress()
+                skip = 1
+
+    return action_addr
+
 
 def resolve_function(pcode):
     if not pcode:
@@ -480,65 +527,82 @@ highFunction = decomp_func.getHighFunction()
 
 if highFunction:
     iterPcodeOps = highFunction.getPcodeOps()
+
     def_action = None
     action_addr = None
     syscall_num = None
     syscall_addr = None
+    op_idx = None
+    skip = None
     while iterPcodeOps.hasNext():
         pcode = iterPcodeOps.next()
         opcode = pcode.getOpcode()
+        var = pcode.getInput(0)
 
         if opcode == PcodeOp.CALL:
             
             resolved_name = resolve_function(pcode)
-            
+
+            # Currently this does not handle the case where the function argument gets implicitly set (ex. XOR R/EDI,R/EDI)
+            # I think SetEquate does not support (?) this atm
+            if "seccomp_init" in resolved_name:
+                action = pcode.getInput(1)
+                def_action = action.getOffset()
+                op_idx = 1
+
+                action_addr = search_actions(var.getPCAddress())
+
+                if not skip:
+                    # Set context
+                    ctx_out = pcode.getOutput()
+                    ctx_high = ctx_out.getHigh()
+                    ctx_high_var = ctx_high.getSymbol()
+                    HighFunctionDBUtil.updateDBVariable(ctx_high_var,"ctx", None, SourceType.USER_DEFINED)
+
+
             if "seccomp_rule_add" in resolved_name:
-                
                 var = pcode.getInput(0)
                 ctx = pcode.getInput(1)
                 action = pcode.getInput(2)
                 syscall = pcode.getInput(3)
-                pc = var.getPCAddress()
+                op_idx = 2
 
                 def_action = action.getOffset()
                 syscall_num = syscall.getOffset()
 
-                listing = currentProgram.getListing()
+                action_addr,syscall_addr = search_all(var.getPCAddress())
 
-                listing = currentProgram.getListing()
-                instr_list = listing.getInstructions(pc,False)
+            if "seccomp_load" in resolved_name:
 
-                action_addr = None
-                syscall_addr = None
+                if not skip:
+                    # Set status
+                    load_out = pcode.getOutput()
+                    load_high = load_out.getHigh()
+                    load_high_var = load_high.getSymbol()
+                    HighFunctionDBUtil.updateDBVariable(load_high_var,"status", None, SourceType.USER_DEFINED)
 
-                for instr in instr_list:
-                    if action_addr and syscall_addr:
-                        break
-                    code = instr.toString()
-                    mnemonic,op = code.split(" ")
-                    if mnemonic.find("MOV") != -1:
-                        src,dst = op.split(",")
-                        if src.find("RSI") != -1 or src.find("ESI") != -1:
-                            action_addr = instr.getAddress()
-                        if src.find("RDX") != -1 or src.find("EDX") != -1:
-                            syscall_addr = instr.getAddress()
+                
+            equateTable = currentProgram.getEquateTable()
 
-                equateTable = currentProgram.getEquateTable()
-
+            
+            if action_addr:
                 action_name = seccomp_def_actions[def_action]
                 action_equate = equateTable.getEquate(action_name)
-                
+
                 if not action_equate:
                     action_equate = equateTable.createEquate(action_name,def_action)
                 
-                action_equate.addReference(action_addr,2)
+                action_equate.addReference(action_addr,op_idx)
 
+            if syscall_addr:
                 syscall_name = syscall_x64[syscall_num]
                 syscall_equate = equateTable.getEquate(syscall_name)
                 
                 if not syscall_equate:
                     syscall_equate = equateTable.createEquate(syscall_name,syscall_num)
-                
+
                 syscall_equate.addReference(syscall_addr,3)
+
+
 
                                     
